@@ -365,14 +365,24 @@ def parse_args(input_args=None):
         help="Number of images that should be generated during validation with `validation_prompt`.",
     )
     parser.add_argument(
-        "--validation_epochs",
+        "--validation_steps",
         type=int,
-        default=50,
+        default=400,
         help=(
-            "Run dreambooth validation every X epochs. Dreambooth validation consists of running the prompt"
-            " `args.validation_prompt` multiple times: `args.num_validation_images`."
+            "Run validation every X steps. Validation consists of running the prompt"
+            " `args.validation_prompt` multiple times: `args.num_validation_images`"
+            " and logging the images."
         ),
     )
+    # parser.add_argument(
+    #     "--validation_epochs",
+    #     type=int,
+    #     default=50,
+    #     help=(
+    #         "Run dreambooth validation every X epochs. Dreambooth validation consists of running the prompt"
+    #         " `args.validation_prompt` multiple times: `args.num_validation_images`."
+    #     ),
+    # )
     parser.add_argument(
         "--do_edm_style_training",
         default=False,
@@ -1785,9 +1795,18 @@ def main(args):
                     # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
                     # Since we predict the noise instead of x_0, the original formulation is slightly changed.
                     # This is discussed in Section 4.2 of the same paper.
-                    snr = compute_snr(noise_scheduler, timesteps)
+
+                    # https://github.com/huggingface/diffusers/pull/6356
+                    if args.with_prior_preservation:
+                        # if we're using prior preservation, we calc snr for instance loss only -
+                        # and hence only need timesteps corresponding to instance images
+                        snr_timesteps, _ = torch.chunk(timesteps, 2, dim=0)
+                    else:
+                        snr_timesteps = timesteps
+
+                    snr = compute_snr(noise_scheduler, snr_timesteps)
                     base_weight = (
-                        torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
+                        torch.stack([snr, args.snr_gamma * torch.ones_like(snr_timesteps)], dim=1).min(dim=1)[0] / snr
                     )
 
                     if noise_scheduler.config.prediction_type == "v_prediction":
@@ -1845,9 +1864,45 @@ def main(args):
                                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
                                     shutil.rmtree(removing_checkpoint)
 
+
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
+                        logger.info(f"Saved state to {save_path}")                                    
+
+                    if args.validation_prompt is not None and global_step % args.validation_steps == 0:
+                        # create pipeline
+                        if not args.train_text_encoder:
+                            text_encoder_one = text_encoder_cls_one.from_pretrained(
+                                args.pretrained_model_name_or_path,
+                                subfolder="text_encoder",
+                                revision=args.revision,
+                                variant=args.variant,
+                            )
+                            text_encoder_two = text_encoder_cls_two.from_pretrained(
+                                args.pretrained_model_name_or_path,
+                                subfolder="text_encoder_2",
+                                revision=args.revision,
+                                variant=args.variant,
+                            )
+                        pipeline = StableDiffusionXLPipeline.from_pretrained(
+                            args.pretrained_model_name_or_path,
+                            vae=vae,
+                            text_encoder=accelerator.unwrap_model(text_encoder_one),
+                            text_encoder_2=accelerator.unwrap_model(text_encoder_two),
+                            unet=accelerator.unwrap_model(unet),
+                            revision=args.revision,
+                            variant=args.variant,
+                            torch_dtype=weight_dtype,
+                        )
+                        pipeline_args = {"prompt": args.validation_prompt}
+
+                        images = log_validation(
+                            pipeline,
+                            args,
+                            accelerator,
+                            pipeline_args,
+                            epoch,
+                        )
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
@@ -1855,42 +1910,6 @@ def main(args):
 
             if global_step >= args.max_train_steps:
                 break
-
-        if accelerator.is_main_process:
-            if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
-                # create pipeline
-                if not args.train_text_encoder:
-                    text_encoder_one = text_encoder_cls_one.from_pretrained(
-                        args.pretrained_model_name_or_path,
-                        subfolder="text_encoder",
-                        revision=args.revision,
-                        variant=args.variant,
-                    )
-                    text_encoder_two = text_encoder_cls_two.from_pretrained(
-                        args.pretrained_model_name_or_path,
-                        subfolder="text_encoder_2",
-                        revision=args.revision,
-                        variant=args.variant,
-                    )
-                pipeline = StableDiffusionXLPipeline.from_pretrained(
-                    args.pretrained_model_name_or_path,
-                    vae=vae,
-                    text_encoder=accelerator.unwrap_model(text_encoder_one),
-                    text_encoder_2=accelerator.unwrap_model(text_encoder_two),
-                    unet=accelerator.unwrap_model(unet),
-                    revision=args.revision,
-                    variant=args.variant,
-                    torch_dtype=weight_dtype,
-                )
-                pipeline_args = {"prompt": args.validation_prompt}
-
-                images = log_validation(
-                    pipeline,
-                    args,
-                    accelerator,
-                    pipeline_args,
-                    epoch,
-                )
 
     # Save the lora layers
     accelerator.wait_for_everyone()
